@@ -84,11 +84,11 @@ class SessionManager {
 
     setSessionKey(null);
 
-    // If websocket exists, ws request to update session key
-    if (_chat.connectionManager.isConnected()) {
-      await _chat.commandManager.updateSessionKey();
-      return;
-    }
+    // If websocket exists, ws request to update session key => Check server error
+    // if (_chat.connectionManager.isConnected()) {
+    //   await _chat.commandManager.updateSessionKey();
+    //   return;
+    // }
 
     final completer = Completer();
     _updateSessionKeyCompleterList.add(completer);
@@ -143,17 +143,17 @@ class SessionManager {
   }
 
   Future<void> _encryptSessionKey(String? sessionKey) async {
+    final userId = _chat.chatContext.currentUserId;
+    if (userId == null) {
+      return; // Check tempSessionKey in markAsDelivered()
+    }
+
     final prefs = await SharedPreferences.getInstance();
 
     if (sessionKey == null) {
       prefs.remove(_userIdKeyPath);
       prefs.remove(_sessionKeyPath);
       return;
-    }
-
-    final userId = _chat.chatContext.currentUserId;
-    if (userId == null) {
-      throw ConnectionRequiredException();
     }
 
     List<int> userId24Data = [];

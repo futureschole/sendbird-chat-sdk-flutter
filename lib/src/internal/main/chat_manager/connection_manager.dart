@@ -5,11 +5,15 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat/chat.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/collection_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/command_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/connection_state/base_connection_state.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/connection_state/connected_state.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/connection_state/connecting_state.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/connection_state/disconnected_state.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/connection_state/reconnecting_state.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
+import 'package:sendbird_chat_sdk/src/internal/network/websocket/command/command.dart';
 import 'package:sendbird_chat_sdk/src/internal/network/websocket/websocket_client.dart';
 import 'package:sendbird_chat_sdk/src/public/core/user/user.dart';
 import 'package:sendbird_chat_sdk/src/public/main/define/exceptions.dart';
@@ -44,19 +48,19 @@ class ConnectionManager {
   }
 
   bool isConnected() {
-    return _currentState.runtimeType.toString() == 'ConnectedState';
+    return _currentState is ConnectedState;
   }
 
   bool isConnecting() {
-    return _currentState.runtimeType.toString() == 'ConnectingState';
+    return _currentState is ConnectingState;
   }
 
   bool isDisconnected() {
-    return _currentState.runtimeType.toString() == 'DisconnectedState';
+    return _currentState is DisconnectedState;
   }
 
   bool isReconnecting() {
-    return _currentState.runtimeType.toString() == 'ReconnectingState';
+    return _currentState is ReconnectingState;
   }
 
   BaseConnectionState getCurrentState() {
@@ -79,11 +83,11 @@ class ConnectionManager {
     );
   }
 
-  Future<void> disconnect({required logout}) async {
+  Future<void> disconnect({required bool logout}) async {
     await _currentState.disconnect(logout: logout);
   }
 
-  Future<bool> reconnect({bool reset = false}) async {
+  Future<bool> reconnect({required bool reset}) async {
     return await _currentState.reconnect(reset: reset);
   }
 
@@ -108,12 +112,8 @@ class ConnectionManager {
     chat.chatContext
       ..currentUserId = userId
       ..accessToken = accessToken
-      ..apiHost = apiHost ?? _getDefaultApiHost()
-      ..apiHeaders = {
-        'SB-User-Agent': _sbUserAgentHeader,
-        'SB-SDK-USER-AGENT': _sbSdkUserAgentHeader,
-        'SendBird': _sendbirdHeader,
-      };
+      ..apiHost = apiHost ?? getDefaultApiHost()
+      ..apiHeaders = getDefaultApiHeader();
 
     if (fromWebSocket) {
       chat.chatContext
@@ -143,7 +143,6 @@ class ConnectionManager {
     final params = {
       'user_id': userId,
       if (nickname != null && nickname != '') 'nickname': nickname,
-      if (accessToken != null) 'access_token': accessToken,
       'SB-User-Agent': _sbUserAgentHeader,
       'SB-SDK-USER-AGENT': _sbSdkUserAgentHeader,
       'expiring_session':
@@ -160,7 +159,7 @@ class ConnectionManager {
       sbLog.d(StackTrace.current, 'webSocketClient?.connect()');
 
       chat.statManager.startWsConnectStat(hostUrl: url);
-      webSocketClient.connect(url);
+      webSocketClient.connect(url: url, accessToken: accessToken);
     }, (e, s) async {
       sbLog.e(StackTrace.current, 'e: $e');
 
@@ -243,6 +242,7 @@ class ConnectionManager {
   Future<void> doDisconnect({
     required bool clear,
     bool logout = false,
+    bool fromEnterBackground = false,
   }) async {
     sbLog.i(
       StackTrace.current,
@@ -258,9 +258,6 @@ class ConnectionManager {
     if (isReconnecting()) {
       reconnectTimer?.cancel();
       reconnectTimer = null;
-      if (clear) {
-        chat.eventManager.notifyReconnectFailed();
-      }
     }
 
     await webSocketClient.close();
@@ -268,8 +265,6 @@ class ConnectionManager {
     final disconnectedUserId = chat.chatContext.currentUserId ?? '';
 
     if (clear || logout) {
-      await chat.eventDispatcher.onLogout();
-
       chat.messageQueueMap.forEach((key, q) => q.cleanUp());
       chat.messageQueueMap.clear();
       // chat.uploads.forEach((key, value) => _api.cancelUploadingFile(key));
@@ -281,7 +276,12 @@ class ConnectionManager {
       chat.apiClient.cleanUp();
 
       if (logout) {
+        await chat.eventDispatcher.onLogout();
+
         chat.chatContext.cleanUp();
+        chat.collectionManager.cleanUpGroupChannelCollections();
+        chat.collectionManager.cleanUpMessageCollections();
+
         //+ [DBManager]
         if (chat.dbManager.isEnabled()) {
           await chat.dbManager.clear();
@@ -292,20 +292,32 @@ class ConnectionManager {
       await chat.eventDispatcher.onDisconnected();
     }
 
-    changeState(DisconnectedState(chat: chat));
+    if (fromEnterBackground && !chat.isBackground && !isReconnecting()) {
+      sbLog.i(StackTrace.current, 'reconnect()');
+      chat.connectionManager.reconnect(reset: true); // Check
+    } else {
+      if (isReconnecting()) {
+        chat.eventManager.notifyReconnectFailed();
+      }
+      changeState(DisconnectedState(chat: chat));
 
-    if (clear && disconnectedUserId.isNotEmpty) {
-      chat.eventManager.notifyDisconnected(disconnectedUserId);
+      if (clear && disconnectedUserId.isNotEmpty) {
+        chat.eventManager.notifyDisconnected(disconnectedUserId);
+      }
     }
   }
 
   Future<bool> doReconnect({bool reset = false}) async {
     sbLog.i(StackTrace.current, 'reset: $reset');
 
+    bool doNotCallReconnectStartedEvent = false;
+    if (isReconnecting() && reset) {
+      doNotCallReconnectStartedEvent = true;
+    }
+
     if (chat.chatContext.currentUser == null ||
         chat.chatContext.sessionKey == null) {
       changeState(DisconnectedState(chat: chat));
-      chat.eventManager.notifyReconnectFailed();
       return false;
     }
 
@@ -339,18 +351,16 @@ class ConnectionManager {
       );
 
       if (chat.chatContext.reconnectTask?.retryCount == 1) {
-        await chat.eventDispatcher.onReconnecting();
-        chat.eventManager.notifyReconnectStarted();
+        if (!doNotCallReconnectStartedEvent) {
+          await chat.eventDispatcher.onReconnecting();
+          chat.eventManager.notifyReconnectStarted();
+        }
       }
 
       // ===== Reconnect =====
       final sessionKey = await chat.sessionManager.getSessionKey();
       final params = {
-        if (sessionKey != null)
-          'key': sessionKey
-        else
-          'user_id': chat.chatContext.currentUserId,
-        'access_token': chat.chatContext.accessToken,
+        if (sessionKey == null) 'user_id': chat.chatContext.currentUserId,
         'SB-User-Agent': _sbUserAgentHeader,
         'SB-SDK-USER-AGENT': _sbSdkUserAgentHeader,
         'expiring_session':
@@ -365,7 +375,11 @@ class ConnectionManager {
 
       runZonedGuarded(() {
         sbLog.d(StackTrace.current, 'webSocketClient?.connect()');
-        webSocketClient.connect(url);
+        webSocketClient.connect(
+          url: url,
+          accessToken: chat.chatContext.accessToken,
+          sessionKey: sessionKey,
+        );
 
         reconnectTimer?.cancel();
         reconnectTimer = null;
@@ -397,12 +411,14 @@ class ConnectionManager {
     }
 
     if (commandString.isEmpty) return;
-    final cmd = CommandManager.parseCommandString(commandString);
-    if (cmd == null) return;
+    List<Command> commands = CommandManager.parseCommandsString(commandString);
+    if (commands.isEmpty) return;
 
     runZonedGuarded(() async {
       try {
-        await chat.commandManager.processCommand(cmd);
+        for (final command in commands) {
+          await chat.commandManager.processCommand(command);
+        }
       } catch (e) {
         sbLog.e(StackTrace.current, 'e: $e');
         rethrow;
@@ -431,7 +447,7 @@ class ConnectionManager {
 //------------------------------//
 // Values
 //------------------------------//
-  String _getDefaultApiHost() {
+  String getDefaultApiHost() {
     final appId = chat.chatContext.appId;
     return 'api-$appId.sendbird.com';
   }
@@ -439,6 +455,14 @@ class ConnectionManager {
   String _getDefaultWsHost() {
     final appId = chat.chatContext.appId;
     return 'wss://ws-$appId.sendbird.com';
+  }
+
+  Map<String, String> getDefaultApiHeader() {
+    return <String, String>{
+      'SB-User-Agent': _sbUserAgentHeader,
+      'SB-SDK-USER-AGENT': _sbSdkUserAgentHeader,
+      'SendBird': _sendbirdHeader,
+    };
   }
 
   String get _sbUserAgentHeader {

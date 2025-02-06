@@ -41,6 +41,9 @@ class RootMessage {
   @JsonKey(name: 'mentioned_users', defaultValue: [])
   List<User> _mentionedUsers;
 
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  List<String> mentionedUserIds;
+
   /// The mentioned users of the message.
   List<User> get mentionedUsers {
     if (chat.chatContext.options.useMemberInfoInMessage) {
@@ -90,12 +93,14 @@ class RootMessage {
     this.customType,
     this.mentionType = MentionType.users,
     List<User> mentionedUsers = const <User>[],
+    List<String>? mentionedUserIds,
     this.allMetaArrays,
     Map<String, dynamic>? extendedMessage,
     this.createdAt = 0,
     this.updatedAt = 0,
     this.mentionedMessageTemplate,
   })  : _mentionedUsers = mentionedUsers,
+        mentionedUserIds = mentionedUserIds ?? [],
         extendedMessage = extendedMessage ?? {};
 
   void set(Chat chat) {
@@ -226,6 +231,18 @@ class RootMessage {
       }
     }
 
+    // mentionedUserIds
+    if (message._mentionedUsers.isNotEmpty) {
+      message.mentionedUserIds
+          .addAll(message._mentionedUsers.map((user) => user.userId));
+    } else {
+      if (json['mentioned_user_ids'] != null &&
+          json['mentioned_user_ids'] is List<String>) {
+        message.mentionedUserIds
+            .addAll(json['mentioned_user_ids'] as List<String>);
+      }
+    }
+
     final metaArray = json['metaarray'];
     final metaArrayKeys = List<String>.from(json['metaarray_key_order'] ?? []);
 
@@ -260,6 +277,7 @@ class RootMessage {
         other.customType == customType &&
         other.mentionType == mentionType &&
         eq(other._mentionedUsers, _mentionedUsers) &&
+        eq(other.mentionedUserIds, mentionedUserIds) &&
         eq(other.allMetaArrays, allMetaArrays) &&
         mapEq(other.extendedMessage, extendedMessage) &&
         other.createdAt == createdAt &&
@@ -276,6 +294,7 @@ class RootMessage {
         channelType,
         mentionType,
         _mentionedUsers,
+        mentionedUserIds,
         allMetaArrays,
         extendedMessage,
         createdAt,

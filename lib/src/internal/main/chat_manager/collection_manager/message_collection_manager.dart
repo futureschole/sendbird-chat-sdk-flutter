@@ -7,18 +7,58 @@ extension MessageCollectionManager on CollectionManager {
 // Add and remove message collection
 //------------------------------//
   void addMessageCollection(BaseMessageCollection collection) {
+    sbLog.d(
+        StackTrace.current, 'channelUrl: ${collection.baseChannel.channelUrl}');
+
     baseMessageCollections.add(collection);
+    _setInitialMessageChangeLogsAndMessagesGapTs();
   }
 
   void removeMessageCollection(BaseMessageCollection collection) {
+    sbLog.d(
+        StackTrace.current, 'channelUrl: ${collection.baseChannel.channelUrl}');
+
     baseMessageCollections.remove(collection);
+  }
+
+//------------------------------//
+// Clean up
+//------------------------------//
+  void cleanUpMessageCollections() {
+    for (final messageCollection in baseMessageCollections) {
+      messageCollection.cleanUp();
+    }
+  }
+
+  void disposeMessageCollection(String channelUrl) {
+    for (final messageCollection in baseMessageCollections) {
+      if (messageCollection.baseChannel.channelUrl == channelUrl) {
+        messageCollection.cleanUp();
+      }
+    }
+  }
+
+//------------------------------//
+// My mute info
+//------------------------------//
+  void setUnmuteTimer(GroupChannel channel, int remainingDuration) {
+    for (final messageCollection in baseMessageCollections) {
+      if (messageCollection.baseChannel.channelUrl == channel.channelUrl) {
+        messageCollection.setUnmuteTimer(remainingDuration);
+        break;
+      }
+    }
   }
 
 //------------------------------//
 // onMessageSentByMe
 //------------------------------//
-  void onMessageSentByMe(RootMessage message) async {
-    sbLog.d(StackTrace.current, 'onMessageSentByMe()');
+  void onMessageSentByMe({
+    required BaseChannel channel,
+    required BaseMessage pendingMessage,
+    required RootMessage sentMessage,
+  }) async {
+    sbLog.d(StackTrace.current);
 
     for (final messageCollection in baseMessageCollections) {
       sendEventsToMessageCollection(
@@ -26,9 +66,42 @@ extension MessageCollectionManager on CollectionManager {
         baseChannel: messageCollection.baseChannel,
         eventSource: CollectionEventSource.eventMessageSent,
         sendingStatus: SendingStatus.succeeded,
-        addedMessages: [message],
+        addedMessages: [sentMessage],
         isReversedAddedMessages: messageCollection.params.reverse,
+        deletedMessageIds: [pendingMessage.messageId],
+        doNotSendDeleteEvent: true,
       );
+    }
+
+    if (channel is GroupChannel) {
+      sendEventsToGroupChannelCollectionList(
+        eventSource: CollectionEventSource.eventMessageSent,
+        addedChannels: [channel],
+      );
+    }
+  }
+
+//------------------------------//
+// updateMessageOffsetTimestamp
+//------------------------------//
+  Future<void> updateMessageOffsetTimestamp({
+    required String channelUrl,
+    required int messageOffsetTimestamp,
+  }) async {
+    sbLog.d(StackTrace.current, 'updateMessageOffsetTimestamp()');
+
+    for (final collection in baseMessageCollections) {
+      if (collection is MessageCollection) {
+        if (collection.isInitialized) {
+          if (collection.baseChannel.channelUrl == channelUrl) {
+            await collection.updateMessageOffsetTimestamp(
+              channelUrl: channelUrl,
+              messageOffsetTimestamp: messageOffsetTimestamp,
+            );
+            break;
+          }
+        }
+      }
     }
   }
 
@@ -37,19 +110,28 @@ extension MessageCollectionManager on CollectionManager {
 //------------------------------//
   Future<void> _requestMessageChangeLogs(
       BaseMessageCollection messageCollection) async {
+    sbLog.d(StackTrace.current,
+        'channelUrl: ${messageCollection.baseChannel.channelUrl}');
+
     final channel = messageCollection.baseChannel;
     final params = MessageChangeLogParams();
     final List<RootMessage> updatedMessages = [];
     final List<dynamic> deletedMessageIds = [];
 
     MessageChangeLogs changeLogs;
+    String? lastToken;
     String? token;
 
     //+ [DBManager]
-    final info =
-        await _chat.dbManager.getMessageChangeLogInfo(channel.channelUrl);
-    if (info != null) {
-      token = info.lastMessageToken;
+    if (_chat.dbManager.isInitialized()) {
+      final info =
+          await _chat.dbManager.getMessageChangeLogInfo(channel.channelUrl);
+      if (info != null) {
+        lastToken = info.lastMessageToken;
+        token = lastToken;
+      }
+    } else {
+      token = lastRequestTokenForMessageChangeLogs; // For web without db
     }
     //- [DBManager]
 
@@ -73,23 +155,35 @@ extension MessageCollectionManager on CollectionManager {
     } while (changeLogs.hasMore);
 
     //+ [DBManager]
-    if (info != null) {
-      await _chat.dbManager.upsertMessageChangeLogInfo(MessageChangeLogInfo(
-        channelUrl: channel.channelUrl,
-        lastMessageToken: token,
-        lastPollToken: info.lastPollToken,
-      ));
+    if (token != null && token.isNotEmpty && token != lastToken) {
+      if (_chat.dbManager.isInitialized()) {
+        MessageChangeLogInfo? info =
+            await _chat.dbManager.getMessageChangeLogInfo(channel.channelUrl);
+        if (info != null) {
+          info.lastMessageToken = token;
+        } else {
+          info = MessageChangeLogInfo(
+            channelUrl: channel.channelUrl,
+            lastMessageToken: token,
+          );
+        }
+        await _chat.dbManager.upsertMessageChangeLogInfo(info);
+      } else {
+        lastRequestTokenForMessageChangeLogs = token;
+      }
     }
     //- [DBManager]
 
-    sendEventsToMessageCollection(
-      messageCollection: messageCollection,
-      baseChannel: channel,
-      eventSource: CollectionEventSource.messageChangeLogs,
-      sendingStatus: SendingStatus.succeeded,
-      updatedMessages: updatedMessages,
-      deletedMessageIds: deletedMessageIds,
-    );
+    if (updatedMessages.isNotEmpty || deletedMessageIds.isNotEmpty) {
+      sendEventsToMessageCollection(
+        messageCollection: messageCollection,
+        baseChannel: channel,
+        eventSource: CollectionEventSource.messageChangeLogs,
+        sendingStatus: SendingStatus.succeeded,
+        updatedMessages: updatedMessages,
+        deletedMessageIds: deletedMessageIds,
+      );
+    }
   }
 
 //------------------------------//
@@ -97,6 +191,9 @@ extension MessageCollectionManager on CollectionManager {
 //------------------------------//
   Future<void> _requestPollChangeLogs(
       BaseMessageCollection messageCollection) async {
+    sbLog.d(StackTrace.current,
+        'channelUrl: ${messageCollection.baseChannel.channelUrl}');
+
     if (_chat.chatContext.appInfo == null ||
         _chat.chatContext.appInfo!.premiumFeatureList.contains('poll') ==
             false) {
@@ -112,13 +209,19 @@ extension MessageCollectionManager on CollectionManager {
     final List<dynamic> deletedMessageIds = [];
 
     PollChangeLogs changeLogs;
+    String? lastToken;
     String? token;
 
     //+ [DBManager]
-    final info =
-        await _chat.dbManager.getMessageChangeLogInfo(groupChannel.channelUrl);
-    if (info != null) {
-      token = info.lastPollToken;
+    if (_chat.dbManager.isInitialized()) {
+      final info = await _chat.dbManager
+          .getMessageChangeLogInfo(groupChannel.channelUrl);
+      if (info != null) {
+        lastToken = info.lastPollToken;
+        token = lastToken;
+      }
+    } else {
+      token = lastRequestTokenForPollChangeLogs; // For web without db
     }
     //- [DBManager]
 
@@ -151,23 +254,35 @@ extension MessageCollectionManager on CollectionManager {
     } while (changeLogs.hasMore);
 
     //+ [DBManager]
-    if (info != null) {
-      await _chat.dbManager.upsertMessageChangeLogInfo(MessageChangeLogInfo(
-        channelUrl: groupChannel.channelUrl,
-        lastMessageToken: info.lastMessageToken,
-        lastPollToken: token,
-      ));
+    if (token != null && token.isNotEmpty && token != lastToken) {
+      if (_chat.dbManager.isInitialized()) {
+        MessageChangeLogInfo? info = await _chat.dbManager
+            .getMessageChangeLogInfo(groupChannel.channelUrl);
+        if (info != null) {
+          info.lastPollToken = token;
+        } else {
+          info = MessageChangeLogInfo(
+            channelUrl: groupChannel.channelUrl,
+            lastPollToken: token,
+          );
+        }
+        await _chat.dbManager.upsertMessageChangeLogInfo(info);
+      } else {
+        lastRequestTokenForPollChangeLogs = token;
+      }
     }
     //- [DBManager]
 
-    sendEventsToMessageCollection(
-      messageCollection: messageCollection,
-      baseChannel: groupChannel,
-      eventSource: CollectionEventSource.pollChangeLogs,
-      sendingStatus: SendingStatus.succeeded,
-      updatedMessages: updatedMessages,
-      deletedMessageIds: deletedMessageIds,
-    );
+    if (updatedMessages.isNotEmpty || deletedMessageIds.isNotEmpty) {
+      sendEventsToMessageCollection(
+        messageCollection: messageCollection,
+        baseChannel: groupChannel,
+        eventSource: CollectionEventSource.pollChangeLogs,
+        sendingStatus: SendingStatus.succeeded,
+        updatedMessages: updatedMessages,
+        deletedMessageIds: deletedMessageIds,
+      );
+    }
   }
 
 //------------------------------//
@@ -176,6 +291,9 @@ extension MessageCollectionManager on CollectionManager {
   Future<void> _requestMessagesGap(
     BaseMessageCollection messageCollection,
   ) async {
+    sbLog.d(StackTrace.current,
+        'channelUrl: ${messageCollection.baseChannel.channelUrl}');
+
     final List<String> deletedPrevMessageIds = [];
     final List<String> deletedNextMessageIds = [];
 
@@ -411,6 +529,8 @@ extension MessageCollectionManager on CollectionManager {
     List<BaseChannel>? updatedChannels,
     List<String>? deletedChannelUrls,
   }) async {
+    sbLog.d(StackTrace.current, eventSource.toString());
+
     //+ [DBManager]
     if (_chat.dbManager.isEnabled()) {
       if (updatedChannels != null) {
@@ -434,6 +554,8 @@ extension MessageCollectionManager on CollectionManager {
           if (updatedChannel.channelUrl ==
               messageCollection.baseChannel.channelUrl) {
             if (!messageCollection.isDisposed) {
+              messageCollection.baseChannel = updatedChannel;
+
               if (messageCollection.baseHandler is MessageCollectionHandler &&
                   updatedChannel is GroupChannel) {
                 (messageCollection.baseHandler as MessageCollectionHandler)
@@ -489,7 +611,12 @@ extension MessageCollectionManager on CollectionManager {
     bool isContinuousAddedMessages = false,
     List<RootMessage>? updatedMessages,
     List<dynamic>? deletedMessageIds,
+    bool doNotSendDeleteEvent = false,
+    bool isMessageOffsetTimestampUpdated = false,
   }) async {
+    sbLog.d(StackTrace.current,
+        'channelUrl: ${messageCollection.baseChannel.channelUrl}, ${eventSource.toString()}');
+
     List<RootMessage> addedMessagesForEvent = [];
     final List<RootMessage> updatedMessagesForEvent = [];
     final List<RootMessage> deletedMessagesForEvent = [];
@@ -498,7 +625,8 @@ extension MessageCollectionManager on CollectionManager {
     if (_chat.dbManager.isEnabled()) {
       // [First] delete
       if (deletedMessageIds != null && deletedMessageIds.isNotEmpty) {
-        if (eventSource != CollectionEventSource.messageInitialize &&
+        if (!(eventSource == CollectionEventSource.messageInitialize &&
+                deletedMessageIds.length == addedMessages?.length) && // Check
             eventSource != CollectionEventSource.messageLoadPrevious &&
             eventSource != CollectionEventSource.messageLoadNext) {
           List<String> deletedStringIds = deletedMessageIds
@@ -579,6 +707,7 @@ extension MessageCollectionManager on CollectionManager {
           if (messageCollection.canAddMessage(eventSource, addedMessage)) {
             addedMessagesForEvent.add(addedMessage);
           } else if (eventSource == CollectionEventSource.eventMessageSent) {
+            doNotSendDeleteEvent = false;
             deletedMessagesForEvent.clear(); // Defensive
             deletedMessagesForEvent.add(addedMessage);
           }
@@ -646,7 +775,8 @@ extension MessageCollectionManager on CollectionManager {
     }
 
     //+ [DBManager]
-    if (eventSource == CollectionEventSource.messageFill) {
+    if (eventSource == CollectionEventSource.messageFill ||
+        isMessageOffsetTimestampUpdated) {
       messageCollection.setValuesFromMessageList(); // Check
     }
     //- [DBManager]
@@ -665,14 +795,13 @@ extension MessageCollectionManager on CollectionManager {
         //- [DBManager]
 
         //+ [DBManager]
-        if (source == CollectionEventSource.localMessagePendingCreated) {
-          // Do not send this event.
-          // [eventMessageSent] will be changed to a updated event if success.
+        if (doNotSendDeleteEvent) {
+          // Do not send this onMessagesDeleted() event.
         } else if (source == CollectionEventSource.messageCacheInitialize ||
             source == CollectionEventSource.messageCacheLoadPrevious ||
             source == CollectionEventSource.messageCacheLoadNext ||
             source == CollectionEventSource.messageFill) {
-          // Do not send this event.
+          // Do not send this onMessagesDeleted() event.
           // Customer does not need this event.
         }
         //- [DBManager]

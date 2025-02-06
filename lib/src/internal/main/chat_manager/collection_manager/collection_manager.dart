@@ -1,10 +1,13 @@
 // Copyright (c) 2023 Sendbird, Inc. All rights reserved.
 
+import 'dart:async';
+
 import 'package:collection/collection.dart';
 import 'package:sendbird_chat_sdk/sendbird_chat_sdk.dart';
 import 'package:sendbird_chat_sdk/src/internal/db/schema/channel/meta/channel_info.dart';
 import 'package:sendbird_chat_sdk/src/internal/db/schema/message/meta/message_changelog_info.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat/chat.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/auto_resend_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
 import 'package:sendbird_chat_sdk/src/internal/network/http/http_client/request/channel/message/channel_messages_gap_request.dart';
 import 'package:sendbird_chat_sdk/src/internal/network/http/http_client/request/channel/message/channel_messages_get_request.dart';
@@ -24,14 +27,19 @@ class CollectionManager {
   // GroupChannelCollection
   final List<GroupChannelCollection> groupChannelCollections = [];
   int lastRequestTsForGroupChannelChangeLogs = 0;
+  String? lastRequestTokenForGroupChannelChangeLogs;
+  bool isDoingGroupChannelBackSync = false;
 
   // MessageCollection
   final List<BaseMessageCollection> baseMessageCollections = [];
   int lastRequestTsForMessageChangeLogs = 0;
+  String? lastRequestTokenForMessageChangeLogs;
   int lastRequestTsForPollChangeLogs = 0;
+  String? lastRequestTokenForPollChangeLogs;
   int lastRequestTsForMessagesGap = 0;
 
-  bool isGroupChannelCollectionsRefreshing = false;
+  Completer<GroupChannelChangeLogsResult>?
+      groupChannelCollectionsRefreshingCompleter;
   bool isBaseMessageCollectionsRefreshing = false;
 
   CollectionManager({required Chat chat}) : _chat = chat {
@@ -46,12 +54,12 @@ class CollectionManager {
   }
 
   void _setInitialGroupChannelChangeLogsTs() {
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = DateTime.now().millisecondsSinceEpoch; // Check
     lastRequestTsForGroupChannelChangeLogs = now;
   }
 
   void _setInitialMessageChangeLogsAndMessagesGapTs() {
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = DateTime.now().millisecondsSinceEpoch; // Check
     lastRequestTsForMessageChangeLogs = now;
     lastRequestTsForPollChangeLogs = now;
     lastRequestTsForMessagesGap = now;
@@ -66,15 +74,24 @@ class CollectionManager {
     //+ [DBManager]
     if (_chat.dbManager.isEnabled()) {
       await _chat.dbManager.checkDBFileSize();
-      await _refresh();
     }
     //- [DBManager]
+
+    AutoResendManager().startAutoResend(_chat);
+  }
+
+  Future<void> onDisconnected() async {
+    sbLog.d(StackTrace.current);
+
+    AutoResendManager().stopAutoResend();
   }
 
   Future<void> onReconnected() async {
     sbLog.d(StackTrace.current);
 
     await _refresh();
+
+    AutoResendManager().startAutoResend(_chat);
   }
 
   Future<void> _refresh() async {
@@ -84,6 +101,7 @@ class CollectionManager {
 
     futures.add(refreshGroupChannelCollections());
     futures.add(_refreshBaseMessageCollections());
+    futures.add(_refreshMessageCollections());
 
     if (futures.isNotEmpty) {
       await Future.wait(futures);
@@ -91,22 +109,35 @@ class CollectionManager {
   }
 
   Future<void> refreshGroupChannelCollections() async {
-    isGroupChannelCollectionsRefreshing = true;
-
-    List<Future<dynamic>> futures = [];
+    sbLog.d(StackTrace.current);
 
     if (groupChannelCollections.isNotEmpty) {
-      futures.add(_requestGroupChannelChangeLogs());
-    }
+      GroupChannelChangeLogsResult result;
 
-    if (futures.isNotEmpty) {
-      await Future.wait(futures);
-    }
+      if (groupChannelCollectionsRefreshingCompleter == null) {
+        groupChannelCollectionsRefreshingCompleter =
+            Completer<GroupChannelChangeLogsResult>();
+        result = await _requestGroupChannelChangeLogs();
+        groupChannelCollectionsRefreshingCompleter?.complete(result);
+        groupChannelCollectionsRefreshingCompleter = null;
+      } else {
+        result = await groupChannelCollectionsRefreshingCompleter!.future;
+      }
 
-    isGroupChannelCollectionsRefreshing = false;
+      if (result.updatedChannels.isNotEmpty ||
+          result.deletedChannelUrls.isNotEmpty) {
+        sendEventsToGroupChannelCollectionList(
+          eventSource: CollectionEventSource.channelChangeLogs,
+          updatedChannels: result.updatedChannels,
+          deletedChannelUrls: result.deletedChannelUrls,
+        );
+      }
+    }
   }
 
   Future<void> _refreshBaseMessageCollections() async {
+    sbLog.d(StackTrace.current);
+
     isBaseMessageCollectionsRefreshing = true;
 
     for (final collection in baseMessageCollections) {
@@ -121,16 +152,32 @@ class CollectionManager {
   }
 
   Future<void> refreshBaseMessageCollection(
-      BaseMessageCollection collection) async {
+    BaseMessageCollection collection,
+  ) async {
+    sbLog.d(
+        StackTrace.current, 'channelUrl: ${collection.baseChannel.channelUrl}');
+
+    if (collection.isInitialized) {
+      await _requestMessageChangeLogs(collection);
+      await _requestPollChangeLogs(collection);
+    }
+  }
+
+  Future<void> _refreshMessageCollections() async {
+    sbLog.d(StackTrace.current);
+
     for (final collection in baseMessageCollections) {
-      if (collection.isInitialized) {
-        await _requestMessageChangeLogs(collection);
-        await _requestPollChangeLogs(collection);
+      if (collection is MessageCollection) {
+        if (collection.isInitialized) {
+          await collection.refresh(); // Check
+        }
       }
     }
   }
 
   Future<void> refreshNotificationCollections() async {
+    sbLog.d(StackTrace.current);
+
     for (final collection in baseMessageCollections) {
       if (collection is NotificationCollection) {
         if (collection.isInitialized) {
@@ -144,6 +191,8 @@ class CollectionManager {
   Future<void> refreshNotificationCollection({
     required String channelUrl,
   }) async {
+    sbLog.d(StackTrace.current, 'channelUrl: $channelUrl');
+
     for (final collection in baseMessageCollections) {
       if (collection is NotificationCollection) {
         if (collection.isInitialized) {
@@ -158,6 +207,8 @@ class CollectionManager {
   }
 
   void markAsReadForFeedChannel(String channelUrl, List<String>? messageIds) {
+    sbLog.d(StackTrace.current, 'channelUrl: $channelUrl');
+
     for (final collection in baseMessageCollections) {
       if (collection is NotificationCollection) {
         if (collection.isInitialized) {
@@ -195,7 +246,7 @@ class CollectionManager {
   }
 
   void onMessagesUpdated(String channelUrl, List<RootMessage>? messages) async {
-    sbLog.d(StackTrace.current, 'onMessagesUpdated()');
+    sbLog.d(StackTrace.current, 'channelUrl: $channelUrl');
 
     for (final collection in baseMessageCollections) {
       if (collection is NotificationCollection) {
@@ -426,6 +477,13 @@ class InternalGroupChannelHandlerForCollectionManager
           break;
         }
       }
+
+      if (channel is GroupChannel) {
+        _collectionManager.sendEventsToGroupChannelCollectionList(
+          eventSource: CollectionEventSource.eventMessageReceived,
+          addedChannels: [channel],
+        );
+      }
     }
   }
 
@@ -590,6 +648,8 @@ class InternalGroupChannelHandlerForCollectionManager
   @override
   void onUserLeft(GroupChannel channel, User user) {
     if (user.isCurrentUser) {
+      _collectionManager.disposeMessageCollection(channel.channelUrl);
+
       _collectionManager.sendEventsToGroupChannelCollectionList(
         eventSource: CollectionEventSource.eventUserLeft,
         deletedChannelUrls: [channel.channelUrl],
@@ -807,4 +867,14 @@ class InternalFeedChannelHandlerForCollectionManager
 //       }
 //     }
 //   }
+}
+
+class GroupChannelChangeLogsResult {
+  final List<GroupChannel> updatedChannels;
+  final List<String> deletedChannelUrls;
+
+  GroupChannelChangeLogsResult({
+    required this.updatedChannels,
+    required this.deletedChannelUrls,
+  });
 }

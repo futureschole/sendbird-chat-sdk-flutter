@@ -1,3 +1,158 @@
+## v4.2.30 (Dec 5, 2024)
+
+### Improvements
+- Fixed the reconnection bug when moving to background and then moving to foreground quickly
+
+## v4.2.29 (Nov 20, 2024)
+
+### Features
+- Updated the versions for `mime`, `web_socket_channel` and `flutter_lints` packages
+
+### Improvements
+- Added the filtering for `replyType` in `MessageCollection`
+
+## v4.2.28 (Nov 15, 2024)
+
+### Improvements
+- Fixed a bug regarding the initial parameters in message collection
+
+## v4.2.27 (Nov 6, 2024)
+
+### Features
+- Applied the message threading policy for last message and unread message count in `GroupChannel`
+
+### Improvements
+- Fixed a bug where update events are not called for messages with OGTags
+- Fixed the reconnection events to be called in pairs
+
+## v4.2.26 (Oct 28, 2024)
+
+### Features
+- Added `useAutoResend` in `SendbirdChatOptions`
+
+### Improvements
+- Fixed a bug regarding `onReconnectFailed()` event in `ConnectionHandler`
+
+## v4.2.25 (Oct 21, 2024)
+
+### Improvements
+- Fixed the reconnection bug while entering foreground
+- Modified the endpoint of sbm metric
+
+## v4.2.24 (Oct 8, 2024)
+
+### Improvements
+- Fixed bugs regarding the events for `hide()` in `GroupChannel`
+- Fixed the message deletion bug in db regarding `resetMyHistory()`
+
+## v4.2.23 (Sep 13, 2024)
+
+### Improvements
+- Fixed the bug regarding `hide()` in `GroupChannel`
+- Fixed the issue regarding websocket security
+
+## v4.2.22 (Aug 23, 2024)
+
+### Improvements
+- Fixed the bugs regarding the channel change logs on multi `GroupChannelCollection`s
+
+## v4.2.21 (Aug 16, 2024)
+
+### Improvements
+- Fixed the bug when upserting a parent message regarding the error on isar
+- Fixed the bug regarding the channel filtering when local caching is not used
+- Fixed the bugs regarding the thumbnail caching for UIKit
+- Fixed a bug regarding reactions on offline mode
+
+## v4.2.20 (Jul 11, 2024)
+
+### Improvements
+- Fixed the parsing bug regarding `markAsRead()` event
+- Fixed the db upsert bug regarding read status
+
+## v4.2.19 (Jul 4, 2024)
+
+### Improvements
+- Fixed a bug that channels are not added when `includeEmpty` is `false` in `GroupChannelCollection`
+- Fixed a bug regarding a channel event when leaving a `GroupChannel`
+- Fixed a bug regarding the filtering on multi `GroupChannelCollection`s
+
+## v4.2.18 (Jun 26, 2024)
+
+### Improvements
+- Fixed the bugs regarding edge cases during `resetMyHistory()` processing
+- Fixed a bug that the filtering is not worked on multi `GroupChannelCollection`s
+- Fixed a bug that channel changelogs are not upserted in db
+- Fixed a bug regarding the result of `init()` in `SendbirdChat`
+
+## v4.2.17 (Jun 18, 2024)
+
+### Improvements
+- Fixed a bug regarding receiving messages during `resetMyHistory()` processing
+
+## v4.2.16 (Jun 13, 2024)
+
+### Improvements
+- Fixed a bug regarding `await` in `resetMyHistory()` in `GroupChannel`
+
+## v4.2.15 (Jun 5, 2024)
+
+### Improvements
+- Fixed the bugs regarding my mute info
+- Fixed the bugs regarding changelogs on web
+- Fixed the bugs regarding connection management
+- Fixed the bugs regarding `markAsDelivered()` in `SendbirdChat`
+- Added `metaData`, `readStatus`, `deliveryStatus` in channel db
+- Fixed a bug when `includeEmpty` is `false` in `GroupChannelCollection`
+
+## v4.2.14 (May 16, 2024)
+
+### Improvements
+- Fixed the exceptions regarding url encoding for api
+- Fixed the bug that profile image is not updated on web
+- Fixed the bugs regarding event, exception and cache
+- Modified the event order regarding failed messages in message collection
+- Improved stability
+
+## v4.2.13 (Apr 30, 2024)
+
+### Improvements
+- Fixed the bugs regarding session update
+
+## v4.2.12 (Apr 24, 2024)
+
+### Features
+- Updated dependency range for `connectivity_plus` package from `^5.0.1` to `>=5.0.1 <7.0.0`
+
+### Improvements
+- Fixed `MessageCollection` regarding `resetMyHistory()` in `GroupChannel`
+- Fixed `removeFailedMessage()` and `removeAllFailedMessages()` in `MessageCollection`
+- Fixed the bugs regarding message change log, pending message removal, typing status and delivered status
+- Added improvements on `getUndeliveredMembers()` method to prevent a potential problem.
+  The return type for `getUndeliveredMembers()` was updated from `List<Member>` to `List<Member>?`.
+  Please update this part of your code if you use `getUndeliveredMembers()`.
+- Improved stability
+
+## v4.2.11 (Apr 18, 2024)
+
+### Improvements
+- Fixed the bug that there are duplicate channels in `GroupChannelCollection`
+- Added default mimeType in `FileMessageCreateParams`
+
+## v4.2.10 (Apr 9, 2024)
+
+### Features
+- Added the privacy manifest file for iOS
+
+### Improvements
+- Fixed the bug that there are duplicate channels in `GroupChannelCollection`
+
+## v4.2.9 (Apr 3, 2024)
+
+### Improvements
+- Fixed the bugs regarding error handling in `MessageCollection`
+- Fixed the bug that `mentionedUserIds` is missing in a pending message
+
 ## v4.2.8 (Mar 27, 2024)
 
 ### Improvements

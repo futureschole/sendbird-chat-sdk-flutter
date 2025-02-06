@@ -2,8 +2,11 @@
 
 import 'dart:async';
 
+import 'package:collection/collection.dart';
 import 'package:sendbird_chat_sdk/sendbird_chat_sdk.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat/chat.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_cache/cache_service.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/auto_resend_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/collection_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/db_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
@@ -39,6 +42,8 @@ abstract class BaseMessageCollection {
 
   BaseChannel get baseChannel => _channel;
 
+  set baseChannel(channel) => _channel = channel;
+
   BaseMessageCollectionHandler get baseHandler => _handler;
 
   set hasPrevious(value) => _hasPrevious = value;
@@ -61,7 +66,7 @@ abstract class BaseMessageCollection {
 
   String get collectionId => _collectionId;
 
-  final BaseChannel _channel;
+  BaseChannel _channel;
   final BaseMessageCollectionHandler _handler;
 
   final MessageListParams _initializeParams;
@@ -85,6 +90,8 @@ abstract class BaseMessageCollection {
   int? _latestSyncedTimestamp;
 
   //- [DBManager]
+
+  Timer? unmuteTimer;
 
   BaseMessageCollection({
     required BaseChannel channel,
@@ -117,9 +124,74 @@ abstract class BaseMessageCollection {
     //- [DBManager]
   }
 
+  //+ [MyMuteInfo]
+  void setUnmuteTimer(int remainingDuration) {
+    _cancelUnmuteTimer();
+
+    if (remainingDuration > 0) {
+      sbLog.d(StackTrace.current, 'remainingDuration: $remainingDuration');
+
+      final ms = remainingDuration + 1000; // Referred by JS SDK
+      unmuteTimer = Timer(Duration(milliseconds: ms), () {
+        runZonedGuarded(() async {
+          if (SendbirdChat.currentUser != null) {
+            final myMuteInfo = await _channel.getMyMuteInfo();
+            if (!myMuteInfo.isMuted) {
+              // My mute info has been already unmuted in server.
+              _setMyMuteInfo(isMuted: false);
+            }
+          }
+        }, (error, stack) {});
+      });
+    }
+  }
+
+  void _cancelUnmuteTimer() {
+    if (unmuteTimer != null) {
+      sbLog.d(StackTrace.current);
+
+      unmuteTimer?.cancel();
+      unmuteTimer = null;
+    }
+  }
+
+  void _setMyMuteInfo({required bool isMuted}) {
+    sbLog.d(StackTrace.current);
+
+    if (_channel is GroupChannel) {
+      final channel = _channel as GroupChannel;
+      final myMember = channel.members.firstWhereOrNull(
+          (member) => member.userId == SendbirdChat.currentUser?.userId);
+
+      if (myMember != null && myMember.isMuted != isMuted) {
+        channel.myMutedState = isMuted ? MuteState.muted : MuteState.unmuted;
+        myMember.isMuted = isMuted;
+
+        _channel.saveToCache(chat); // Check
+
+        if (isMuted) {
+          chat.eventManager.notifyUserMuted(
+            _channel,
+            RestrictedUser.fromJson(myMember.toJson()),
+          );
+        } else {
+          chat.eventManager.notifyUserUnmuted(_channel, myMember);
+        }
+      }
+    }
+  }
+
+  //- [MyMuteInfo]
+
+  void cleanUp() {
+    _cancelUnmuteTimer();
+  }
+
   /// Disposes current [MessageCollection] and stops all events from being received.
   void dispose() {
     sbLog.i(StackTrace.current, 'dispose()');
+    cleanUp();
+
     messageList.clear();
     _chat.collectionManager.removeMessageCollection(this);
     _isDisposed = true;
@@ -148,6 +220,10 @@ abstract class BaseMessageCollection {
       final localInitializeParams = MessageListParams()
         ..copyWith(_initializeParams);
 
+      final int? messageOffsetTimestamp = (_channel is GroupChannel)
+          ? (_channel as GroupChannel).messageOffsetTimestamp
+          : null;
+
       final localPreviousMessages = await _chat.dbManager.getMessages(
         channelType: _channel.channelType,
         channelUrl: _channel.channelUrl,
@@ -155,6 +231,7 @@ abstract class BaseMessageCollection {
         timestamp: _startingPoint,
         params: localInitializeParams..inclusive = false,
         isPrevious: true,
+        messageOffsetTimestamp: messageOffsetTimestamp,
       );
 
       List<RootMessage> localStartingPointMessages = [];
@@ -163,6 +240,7 @@ abstract class BaseMessageCollection {
           channelType: _channel.channelType,
           channelUrl: _channel.channelUrl,
           timestamp: _startingPoint,
+          messageOffsetTimestamp: messageOffsetTimestamp,
         );
         localStartingPointMessages.addAll(messages);
       }
@@ -174,6 +252,7 @@ abstract class BaseMessageCollection {
         timestamp: _startingPoint,
         params: localInitializeParams..inclusive = false,
         isPrevious: false,
+        messageOffsetTimestamp: messageOffsetTimestamp,
       );
 
       if (_initializeParams.reverse) {
@@ -208,15 +287,35 @@ abstract class BaseMessageCollection {
         );
       }
 
-      _initializeParams.includeMetaArray = true;
-      _initializeParams.includeReactions = true;
-      _initializeParams.includeThreadInfo = true;
-      _initializeParams.includeParentMessageInfo = true;
+      //+ Failed messages
+      final failedMessages = await _chat.dbManager.getFailedMessages(
+        channelType: _channel.channelType,
+        channelUrl: _channel.channelUrl,
+        reverse: _initializeParams.reverse,
+      );
+
+      if (failedMessages.isNotEmpty) {
+        await _chat.collectionManager.sendEventsToMessageCollection(
+          messageCollection: this,
+          baseChannel: _channel,
+          eventSource: CollectionEventSource.messageCacheInitialize,
+          sendingStatus: SendingStatus.failed,
+          addedMessages: failedMessages,
+          isReversedAddedMessages: _initializeParams.reverse,
+        );
+      }
+      //- Failed messages
     }
     //- [DBManager]
 
+    _initializeParams.includeMetaArray = true;
+    _initializeParams.includeReactions = true;
+    _initializeParams.includeThreadInfo = true;
+    _initializeParams.includeParentMessageInfo = true;
+
     List<RootMessage> messages = [];
     ChannelMessagesGetResponse? res;
+    Object? exception;
 
     if (isCacheHit == false) {
       try {
@@ -233,10 +332,17 @@ abstract class BaseMessageCollection {
         ));
 
         messages.addAll(res.messages);
-      } catch (_) {}
+      } catch (e) {
+        exception = e;
+      }
     }
 
     if (_isDisposed) {
+      if (exception != null && !_chat.apiClient.throwExceptionForTest) {
+        if (_chat.dbManager.isEnabled() == false) {
+          throw exception;
+        }
+      }
       return;
     }
 
@@ -250,8 +356,16 @@ abstract class BaseMessageCollection {
       //+ [DBManager]
       if (_chat.dbManager.isEnabled()) {
         final List<RootMessage> addedMessages = [...messages];
-        final Set<String> deletedMessageIds =
-            messageList.map((message) => message.rootId).toSet();
+        final Set<String> deletedMessageIds = messageList
+            .where((message) {
+              if (message is BaseMessage &&
+                  message.sendingStatus == SendingStatus.succeeded) {
+                return true;
+              }
+              return false;
+            })
+            .map((message) => message.rootId)
+            .toSet();
 
         await _chat.collectionManager.sendEventsToMessageCollection(
           messageCollection: this,
@@ -279,27 +393,13 @@ abstract class BaseMessageCollection {
       }
     }
 
-    //+ [DBManager]
-    if (_chat.dbManager.isEnabled()) {
-      // Failed messages
-      final failedMessages = await _chat.dbManager.getFailedMessages(
-        channelType: _channel.channelType,
-        channelUrl: _channel.channelUrl,
-        reverse: _initializeParams.reverse,
-      );
-
-      if (failedMessages.isNotEmpty) {
-        await _chat.collectionManager.sendEventsToMessageCollection(
-          messageCollection: this,
-          baseChannel: _channel,
-          eventSource: CollectionEventSource.messageCacheInitialize,
-          sendingStatus: SendingStatus.failed,
-          addedMessages: failedMessages,
-          isReversedAddedMessages: _initializeParams.reverse,
-        );
+    if (exception != null && !_chat.apiClient.throwExceptionForTest) {
+      if (_chat.dbManager.isEnabled() == false) {
+        throw exception;
       }
     }
-    //- [DBManager]
+
+    AutoResendManager().startAutoResend(chat);
   }
 
   void _setValuesForInitialize({
@@ -474,6 +574,7 @@ abstract class BaseMessageCollection {
     List<RootMessage> messages = [];
     bool? hasNext;
     ChannelMessagesGetResponse? res;
+    Object? exception;
 
     if (isCacheHit == false) {
       try {
@@ -493,11 +594,24 @@ abstract class BaseMessageCollection {
 
         messages.addAll(res.messages);
         hasNext = res.hasNext;
-      } catch (_) {}
+      } catch (e) {
+        exception = e;
+
+        if (isPrevious) {
+          hasPrevious = true;
+        } else {
+          hasNext = true;
+        }
+      }
     }
 
     if (_isDisposed) {
       _isLoading = false;
+      if (exception != null && !_chat.apiClient.throwExceptionForTest) {
+        if (_chat.dbManager.isEnabled() == false) {
+          throw exception;
+        }
+      }
       return;
     }
 
@@ -562,6 +676,11 @@ abstract class BaseMessageCollection {
     }
 
     _isLoading = false;
+    if (exception != null && !_chat.apiClient.throwExceptionForTest) {
+      if (_chat.dbManager.isEnabled() == false) {
+        throw exception;
+      }
+    }
   }
 
   void _setValuesForLoadPrevious({
@@ -687,8 +806,14 @@ abstract class BaseMessageCollection {
     // hasPrevious
     if (hasPrevious) {
       if (messageList.isNotEmpty) {
-        if (addedMessage.createdAt < messageList.first.createdAt) {
-          return false;
+        if (params.reverse) {
+          if (addedMessage.createdAt < messageList.last.createdAt) {
+            return false;
+          }
+        } else {
+          if (addedMessage.createdAt < messageList.first.createdAt) {
+            return false;
+          }
         }
       }
     }
@@ -696,9 +821,24 @@ abstract class BaseMessageCollection {
     // hasNext
     if (hasNext) {
       if (messageList.isNotEmpty) {
-        if (addedMessage.createdAt > messageList.first.createdAt) {
-          return false;
+        if (params.reverse) {
+          if (addedMessage.createdAt > messageList.first.createdAt) {
+            return false;
+          }
+        } else {
+          if (addedMessage.createdAt > messageList.last.createdAt) {
+            return false;
+          }
         }
+      }
+    }
+
+    // messageOffsetTimestamp
+    if (_channel is GroupChannel &&
+        (_channel as GroupChannel).messageOffsetTimestamp != null) {
+      if (addedMessage.createdAt <
+          (_channel as GroupChannel).messageOffsetTimestamp!) {
+        return false;
       }
     }
 
@@ -745,9 +885,7 @@ abstract class BaseMessageCollection {
     }
 
     // [Filter] senderIds
-    if (addedMessage is BaseMessage &&
-        params.senderIds != null &&
-        params.customTypes!.isNotEmpty) {
+    if (addedMessage is BaseMessage && params.senderIds != null) {
       bool found = false;
       for (final senderId in params.senderIds!) {
         if (addedMessage.sender?.userId == senderId) {
@@ -758,6 +896,27 @@ abstract class BaseMessageCollection {
 
       if (!found) {
         return false;
+      }
+    }
+
+    // [Filter] replyType
+    if (addedMessage is BaseMessage) {
+      switch (params.replyType) {
+        case ReplyType.none:
+          if (addedMessage.parentMessageId != null) {
+            return false;
+          }
+          break;
+        case ReplyType.all:
+          break;
+        case ReplyType.onlyReplyToChannel:
+          if (addedMessage.parentMessageId != null &&
+              !addedMessage.isReplyToChannel) {
+            return false;
+          }
+          break;
+        case null:
+          break;
       }
     }
 
@@ -785,6 +944,9 @@ abstract class BaseMessageCollection {
           originalMessage.poll!.updatedAt <= updatedMessage.poll!.updatedAt) {
         canUpdate = true;
       }
+    } else if (eventSource == CollectionEventSource.eventMessageUpdated) {
+      // eg. Updated message for OGTag
+      canUpdate = true;
     } else if (eventSource == CollectionEventSource.eventReactionUpdated) {
       // Check updatedAt (?)
       canUpdate = true;
@@ -800,6 +962,34 @@ abstract class BaseMessageCollection {
     }
 
     return canUpdate;
+  }
+
+  Future<void> updateMessageOffsetTimestamp({
+    required String channelUrl,
+    required int messageOffsetTimestamp,
+  }) async {
+    if (_initializeParams.reverse) {
+      _hasNext = false;
+    } else {
+      _hasPrevious = false;
+    }
+
+    final deletedMessageIds = messageList.where((message) {
+      return message.createdAt < messageOffsetTimestamp;
+    }).map((message) {
+      return message.rootId;
+    }).toList();
+
+    if (deletedMessageIds.isNotEmpty) {
+      await _chat.collectionManager.sendEventsToMessageCollection(
+        messageCollection: this,
+        baseChannel: baseChannel,
+        eventSource: CollectionEventSource.eventMessageDeleted,
+        sendingStatus: SendingStatus.succeeded,
+        deletedMessageIds: deletedMessageIds,
+        isMessageOffsetTimestampUpdated: true,
+      );
+    }
   }
 
   /// Sends mark as read to this channel.

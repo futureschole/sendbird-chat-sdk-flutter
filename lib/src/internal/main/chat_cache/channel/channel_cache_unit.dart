@@ -15,7 +15,7 @@ class ChannelCacheUnit implements CacheUnit {
   DeliveryStatus? deliveryStatus;
   Map<String, TypingStatus> typingStatusMap = {}; // userId key
   Map<String, ReadStatus> readStatusMap = {}; // userId key
-  MetaDataCache<String>? _metaDataCache;
+  MetaDataCache<String>? metaDataCache;
 
   @override
   void insert(Cacheable data) {
@@ -26,9 +26,9 @@ class ChannelCacheUnit implements CacheUnit {
         channel = data;
       }
     } else if (data is ReadStatus) {
-      final existData = readStatusMap[data.key];
-      if (existData != null) {
-        existData.copyWith(data);
+      final readStatus = readStatusMap[data.key];
+      if (readStatus != null) {
+        readStatus.copyWith(data);
       } else {
         readStatusMap[data.key] = data;
       }
@@ -39,33 +39,35 @@ class ChannelCacheUnit implements CacheUnit {
         deliveryStatus = data;
       }
     } else if (data is TypingStatus) {
-      final existData = typingStatusMap[data.key];
-      if (existData != null) {
-        existData.copyWith(data);
+      final typingStatus = typingStatusMap[data.key];
+      if (typingStatus != null) {
+        typingStatus.copyWith(data);
       } else {
         typingStatusMap[data.key] = data;
       }
+
+      data.setTypingTimer();
     } else if (data is MetaDataCache<String>) {
-      if (_metaDataCache != null) {
-        _metaDataCache?.merge(data);
+      if (metaDataCache != null) {
+        metaDataCache!.merge(data);
       } else {
-        _metaDataCache = data;
+        metaDataCache = data;
       }
     }
   }
 
   @override
   void delete<T extends Cacheable>({String? key, Cacheable? data}) {
-    if (T == DeliveryStatus || data is DeliveryStatus) {
-      deliveryStatus = null;
-    } else if (T == TypingStatus || data is TypingStatus) {
-      typingStatusMap.remove(key);
-    } else if (T == ReadStatus || data is ReadStatus) {
+    if (data is ReadStatus) {
       readStatusMap.remove(key);
-    } else if (T == MetaDataCache || data is MetaDataCache) {
-      _metaDataCache = null;
+    } else if (data is DeliveryStatus) {
+      deliveryStatus = null;
+    } else if (data is TypingStatus) {
+      typingStatusMap.remove(key);
+      data.cancelTypingTimer();
+    } else if (data is MetaDataCache) {
+      metaDataCache = null;
     }
-    // channel should be delete itself
   }
 
   @override
@@ -77,18 +79,18 @@ class ChannelCacheUnit implements CacheUnit {
       return channel as T?;
     } else if (T == ReadStatus) {
       return readStatusMap[key] as T?;
-    } else if (T == TypingStatus) {
-      return typingStatusMap[key] as T?;
     } else if (T == DeliveryStatus) {
       return deliveryStatus as T?;
+    } else if (T == TypingStatus) {
+      return typingStatusMap[key] as T?;
     } else if (T == MetaDataCache) {
-      return _metaDataCache as T?;
+      return metaDataCache as T?;
     }
     return null;
   }
 
   @override
-  void markAsDirty() {
+  void markAsDirty() async {
     channel?.dirty = true;
     deliveryStatus?.dirty = true;
     for (final element in readStatusMap.values) {

@@ -4,6 +4,10 @@ part of 'package:sendbird_chat_sdk/src/public/core/channel/group_channel/group_c
 
 extension GroupChannelExtensions on GroupChannel {
   bool shouldUpdateLastMessage(BaseMessage message, Sender? sender) {
+    if (_shouldUpdateLastMessageByThreadingPolicy(message) == false) {
+      return false;
+    }
+
     final lm = lastMessage;
     if (!message.isSilent ||
         sender?.isCurrentUser == true ||
@@ -22,6 +26,10 @@ extension GroupChannelExtensions on GroupChannel {
   }
 
   bool updateUnreadCount(RootMessage message) {
+    if (_shouldUpdateUnreadMessageCountByThreadingPolicy(message) == false) {
+      return false;
+    }
+
     final currentUser = chat.chatContext.currentUser;
 
     if (message is BaseMessage) {
@@ -58,11 +66,11 @@ extension GroupChannelExtensions on GroupChannel {
   }
 
   int myReadReceipt() {
-    final status = chat.channelCache.find<ReadStatus>(
+    final readStatus = chat.channelCache.find<ReadStatus>(
       channelKey: channelUrl,
       key: chat.chatContext.currentUserId,
     );
-    return status?.timestamp ?? 0;
+    return readStatus?.timestamp ?? 0;
   }
 
   bool get canChangeUnreadMessageCount =>
@@ -92,19 +100,19 @@ extension GroupChannelExtensions on GroupChannel {
     members.sort((a, b) => a.nickname.compareTo(b.nickname));
 
     final ts = DateTime.now().millisecondsSinceEpoch;
-    final delivery = DeliveryStatus(
+    final deliveryStatus = DeliveryStatus(
       channelUrl: channelUrl,
       updatedDeliveryStatus: {newMember.userId: ts},
     );
-    final read = ReadStatus(
+    final readStatus = ReadStatus(
       channelType: channelType,
       channelUrl: channelUrl,
       timestamp: ts,
       userId: newMember.userId,
     );
 
-    delivery.saveToCache(chat);
-    read.saveToCache(chat);
+    deliveryStatus.saveToCache(chat);
+    readStatus.saveToCache(chat);
 
     _refreshMemberCounts();
   }
@@ -164,5 +172,47 @@ extension GroupChannelExtensions on GroupChannel {
         .where((element) => element.memberState == MemberState.joined)
         .toList()
         .length;
+  }
+
+  bool _shouldUpdateLastMessageByThreadingPolicy(RootMessage message) {
+    return _shouldUpdateByThreadingPolicy(
+      message: message,
+      threadingPolicy: chat.chatContext.appInfo?.lastMsgThreadingPolicy,
+    );
+  }
+
+  bool _shouldUpdateUnreadMessageCountByThreadingPolicy(RootMessage message) {
+    return _shouldUpdateByThreadingPolicy(
+      message: message,
+      threadingPolicy: chat.chatContext.appInfo?.unreadCntThreadingPolicy,
+    );
+  }
+
+  bool _shouldUpdateByThreadingPolicy({
+    required RootMessage message,
+    required int? threadingPolicy,
+  }) {
+    bool result = true;
+    bool isReplyMessage = message is BaseMessage &&
+        message.parentMessageId != null &&
+        message.parentMessageId! > 0;
+
+    if (isReplyMessage && threadingPolicy != null) {
+      switch (threadingPolicy) {
+        case 0: // NONE
+          break;
+        case 1: // INCLUDE_REPLY
+          break;
+        case 2: // EXCLUDE_REPLY
+          result = false;
+          break;
+        case 3: // INCLUDE_REPLY_TO_CHANNEL
+          if (message.isReplyToChannel == false) {
+            result = false;
+          }
+          break;
+      }
+    }
+    return result;
   }
 }

@@ -71,8 +71,7 @@ extension BaseChannelMessage on BaseChannel {
     ) as UserMessage;
 
     if (this is GroupChannel) {
-      pendingUserMessage.messageId =
-          resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
+      pendingUserMessage.messageId = resendMessageId ?? 0;
 
       for (final messageCollection
           in chat.collectionManager.baseMessageCollections) {
@@ -103,7 +102,8 @@ extension BaseChannelMessage on BaseChannel {
       final error = ConnectionRequiredException();
       pendingUserMessage
         ..errorCode = error.code
-        ..sendingStatus = SendingStatus.failed;
+        ..sendingStatus = SendingStatus.failed
+        ..messageId = resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
 
       if (this is GroupChannel) {
         for (final messageCollection
@@ -138,29 +138,18 @@ extension BaseChannelMessage on BaseChannel {
           return;
         }
 
-        if (this is GroupChannel) {
-          for (final messageCollection
-              in chat.collectionManager.baseMessageCollections) {
-            if (messageCollection.baseChannel.channelUrl == channelUrl) {
-              await chat.collectionManager.sendEventsToMessageCollection(
-                messageCollection: messageCollection,
-                baseChannel: this,
-                eventSource: CollectionEventSource.localMessagePendingCreated,
-                sendingStatus: SendingStatus.succeeded,
-                deletedMessageIds: [pendingUserMessage.rootId],
-              );
-              break;
-            }
-          }
-        }
-
         final message = RootMessage.getMessageFromJsonWithChat<UserMessage>(
           chat,
           result.payload,
           commandType: result.cmd,
         ) as UserMessage;
 
-        chat.collectionManager.onMessageSentByMe(message);
+        chat.collectionManager.onMessageSentByMe(
+          channel: this,
+          pendingMessage: pendingUserMessage,
+          sentMessage: message,
+        );
+
         if (handler != null) {
           handler(message, null);
         }
@@ -171,7 +160,9 @@ extension BaseChannelMessage on BaseChannel {
       if (e is SendbirdException) {
         pendingUserMessage
           ..errorCode = e.code ?? SendbirdError.unknownError
-          ..sendingStatus = SendingStatus.failed;
+          ..sendingStatus = SendingStatus.failed
+          ..messageId =
+              resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
 
         if (this is GroupChannel) {
           for (final messageCollection
@@ -270,6 +261,14 @@ extension BaseChannelMessage on BaseChannel {
       throw InvalidParameterException();
     }
 
+    final fileSize = params.fileInfo.file?.lengthSync() ??
+        params.fileInfo.fileBytes?.lengthInBytes ??
+        0;
+
+    if (fileSize > chat.chatContext.uploadSizeLimit) {
+      throw FileSizeLimitExceededException();
+    }
+
     final pendingFileMessage =
         FileMessage.fromParams(params: params, channel: this)..set(chat);
 
@@ -279,8 +278,7 @@ extension BaseChannelMessage on BaseChannel {
     pendingFileMessage.messageCreateParams = params;
 
     if (this is GroupChannel) {
-      pendingFileMessage.messageId =
-          resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
+      pendingFileMessage.messageId = resendMessageId ?? 0;
 
       for (final messageCollection
           in chat.collectionManager.baseMessageCollections) {
@@ -324,7 +322,10 @@ extension BaseChannelMessage on BaseChannel {
                 .timeout(
               Duration(seconds: chat.chatContext.options.fileTransferTimeout),
               onTimeout: () {
-                pendingFileMessage.sendingStatus = SendingStatus.failed;
+                pendingFileMessage
+                  ..sendingStatus = SendingStatus.failed
+                  ..messageId =
+                      resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
 
                 if (this is GroupChannel) {
                   for (final messageCollection
@@ -380,7 +381,9 @@ extension BaseChannelMessage on BaseChannel {
             final error = ConnectionRequiredException();
             messageBeforeSent
               ..errorCode = error.code
-              ..sendingStatus = SendingStatus.failed;
+              ..sendingStatus = SendingStatus.failed
+              ..messageId =
+                  resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
 
             if (this is GroupChannel) {
               for (final messageCollection
@@ -408,32 +411,21 @@ extension BaseChannelMessage on BaseChannel {
             chat.commandManager.sendCommand(cmd).then((result) async {
               if (result == null) return;
 
-              if (this is GroupChannel) {
-                for (final messageCollection
-                    in chat.collectionManager.baseMessageCollections) {
-                  if (messageCollection.baseChannel.channelUrl == channelUrl) {
-                    await chat.collectionManager.sendEventsToMessageCollection(
-                      messageCollection: messageCollection,
-                      baseChannel: this,
-                      eventSource:
-                          CollectionEventSource.localMessagePendingCreated,
-                      sendingStatus: SendingStatus.succeeded,
-                      deletedMessageIds: [messageBeforeSent.rootId],
-                    );
-                    break;
-                  }
-                }
-              }
-
               final message =
                   RootMessage.getMessageFromJsonWithChat<FileMessage>(
                 chat,
                 result.payload,
                 channelType: channelType,
                 commandType: result.cmd,
-              ) as FileMessage;
+              ) as FileMessage
+                    ..file = params.fileInfo.file; // Check
 
-              chat.collectionManager.onMessageSentByMe(message);
+              chat.collectionManager.onMessageSentByMe(
+                channel: this,
+                pendingMessage: messageBeforeSent,
+                sentMessage: message,
+              );
+
               if (handler != null) {
                 handler(message, null);
               }
@@ -449,24 +441,12 @@ extension BaseChannelMessage on BaseChannel {
             );
             final message = await chat.apiClient.send<FileMessage>(request);
 
-            if (this is GroupChannel) {
-              for (final messageCollection
-                  in chat.collectionManager.baseMessageCollections) {
-                if (messageCollection.baseChannel.channelUrl == channelUrl) {
-                  await chat.collectionManager.sendEventsToMessageCollection(
-                    messageCollection: messageCollection,
-                    baseChannel: this,
-                    eventSource:
-                        CollectionEventSource.localMessagePendingCreated,
-                    sendingStatus: SendingStatus.succeeded,
-                    deletedMessageIds: [messageBeforeSent.rootId],
-                  );
-                  break;
-                }
-              }
-            }
+            chat.collectionManager.onMessageSentByMe(
+              channel: this,
+              pendingMessage: messageBeforeSent,
+              sentMessage: message,
+            );
 
-            chat.collectionManager.onMessageSentByMe(message);
             if (handler != null) {
               handler(message, null);
             }
@@ -509,7 +489,9 @@ extension BaseChannelMessage on BaseChannel {
       if (e is SendbirdException) {
         pendingFileMessage
           ..errorCode = e.code ?? SendbirdError.unknownError
-          ..sendingStatus = SendingStatus.failed;
+          ..sendingStatus = SendingStatus.failed
+          ..messageId =
+              resendMessageId ?? DateTime.now().millisecondsSinceEpoch;
 
         if (this is GroupChannel) {
           for (final messageCollection
@@ -574,7 +556,11 @@ extension BaseChannelMessage on BaseChannel {
       throw InvalidParameterException();
     }
     if (!message.isResendable()) {
-      throw InvalidParameterException();
+      if (message.errorCode == SendbirdError.fileSizeLimitExceeded) {
+        throw FileSizeLimitExceededException();
+      } else {
+        throw InvalidParameterException();
+      }
     }
 
     if (message.messageCreateParams != null) {

@@ -65,9 +65,13 @@ class SendbirdChat {
     required String appId,
     SendbirdChatOptions? options,
   }) async {
-    bool result = false;
-    _instance._chat.chatContext.appId = appId;
-    _instance._chat.chatContext.options = options ?? SendbirdChatOptions();
+    bool result = true;
+
+    _instance._chat.chatContext.init(
+      chat: _instance._chat,
+      appId: appId,
+      options: options ?? SendbirdChatOptions(),
+    );
 
     //+ [DBManager]
     await _instance._chat.dbManager.init();
@@ -125,7 +129,7 @@ class SendbirdChat {
 
   /// Returns current application information with [AppInfo].
   static AppInfo? getAppInfo() {
-    sbLog.i(StackTrace.current);
+    // sbLog.i(StackTrace.current);
     return _instance._chat.getAppInfo();
   }
 
@@ -198,6 +202,7 @@ class SendbirdChat {
 
   /// Sends mark as delivered to this channel when you received push message from us.
   /// [data] is the payload data from the push.
+  /// Delivery receipt is a premium feature.
   static Future<void> markAsDelivered(
       {required Map<String, dynamic> data}) async {
     sbLog.i(StackTrace.current, 'data: $data');

@@ -29,7 +29,7 @@ class FileMessage extends BaseMessage {
   final String url;
 
   /// The secure file URL.
-  String? get secureUrl {
+  String get secureUrl {
     final eKey = chat.chatContext.eKey;
     if (requireAuth && eKey != null) {
       // https://github.com/flutter/flutter/issues/25107
@@ -79,7 +79,6 @@ class FileMessage extends BaseMessage {
     Sender? sender,
     List<User> mentionedUsers = const [],
     MentionType mentionType = MentionType.users,
-    List<String>? requestedMentionUserIds,
     int createdAt = 0,
     int updatedAt = 0,
     int? parentMessageId,
@@ -188,6 +187,12 @@ class FileMessage extends BaseMessage {
       createdAt: DateTime.now().millisecondsSinceEpoch,
       requireAuth: false,
     );
+
+    // mentionedUserIds
+    if (params.mentionedUserIds != null &&
+        params.mentionedUserIds!.isNotEmpty) {
+      message.mentionedUserIds.addAll(params.mentionedUserIds!);
+    }
     return message;
   }
 
@@ -250,7 +255,7 @@ class Thumbnail {
 
   /// The secure thumbnail URL.
   /// @since 4.2.5
-  String? get secureUrl {
+  String get secureUrl {
     if (_chat != null && _requireAuth != null) {
       final eKey = _chat!.chatContext.eKey;
       if (_requireAuth! && eKey != null) {

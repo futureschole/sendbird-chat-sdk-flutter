@@ -1,7 +1,11 @@
 // Copyright (c) 2023 Sendbird, Inc. All rights reserved.
 
+import 'dart:async';
+
+import 'package:collection/collection.dart';
 import 'package:sendbird_chat_sdk/sendbird_chat_sdk.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat/chat.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/collection_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
 
 /// Message collection that handles message lists.
@@ -42,16 +46,19 @@ class MessageCollection extends BaseMessageCollection {
           useMessageCollection: true,
         );
     //- [DBManager]
+
+    refresh(); // Check
   }
 
   /// Gets all failed messages of this MessageCollection
   /// @since 4.2.0
   Future<List<BaseMessage>> getFailedMessages() async {
-    sbLog.i(StackTrace.current, 'getFailedMessages()');
-    return await chat.dbManager.getFailedMessages(
+    final failedMessages = await chat.dbManager.getFailedMessages(
       channelType: ChannelType.group,
       channelUrl: channel.channelUrl,
     );
+    sbLog.i(StackTrace.current, '${failedMessages.length}');
+    return failedMessages;
   }
 
   /// Removes specific failed messages of this MessageCollection.
@@ -59,7 +66,7 @@ class MessageCollection extends BaseMessageCollection {
   Future<void> removeFailedMessages({
     required List<BaseMessage> messages,
   }) async {
-    sbLog.i(StackTrace.current, 'removeFailedMessages()');
+    sbLog.i(StackTrace.current, '${messages.length}');
     await chat.dbManager.removeFailedMessages(
       channelType: ChannelType.group,
       channelUrl: channel.channelUrl,
@@ -70,10 +77,42 @@ class MessageCollection extends BaseMessageCollection {
   /// Removes all failed messages of this MessageCollection.
   /// @since 4.2.0
   Future<void> removeAllFailedMessages() async {
-    sbLog.i(StackTrace.current, 'removeAllFailedMessages()');
+    sbLog.i(StackTrace.current);
     await chat.dbManager.removeAllFailedMessages(
       channelType: ChannelType.group,
       channelUrl: channel.channelUrl,
     );
+  }
+
+  // Refresh
+  Future<void> refresh() async {
+    sbLog.i(StackTrace.current);
+
+    runZonedGuarded(() async {
+      if (SendbirdChat.currentUser != null) {
+        GroupChannel.refresh(channel.channelUrl).then((channel) async {
+          baseChannel = channel; // Check
+
+          if (!chat.isTest) {
+            chat.collectionManager.sendEventsToGroupChannelCollectionList(
+              eventSource: CollectionEventSource.channelRefreshed,
+              updatedChannels: [channel],
+            );
+          }
+
+          final myMember = channel.members.firstWhereOrNull(
+              (member) => member.userId == SendbirdChat.currentUser?.userId);
+
+          if (myMember != null && myMember.isMuted) {
+            final myMuteInfo = await channel.getMyMuteInfo();
+            if (myMuteInfo.remainingDuration != null) {
+              if (myMuteInfo.remainingDuration! > 0) {
+                setUnmuteTimer(myMuteInfo.remainingDuration!);
+              }
+            }
+          }
+        });
+      }
+    }, (error, stack) {});
   }
 }

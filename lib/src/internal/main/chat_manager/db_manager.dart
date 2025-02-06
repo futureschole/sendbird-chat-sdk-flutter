@@ -1,5 +1,6 @@
 // Copyright (c) 2023 Sendbird, Inc. All rights reserved.
 
+import 'package:flutter/foundation.dart';
 import 'package:isar/isar.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -33,11 +34,14 @@ import 'package:sendbird_chat_sdk/src/internal/main/model/reconnect_task.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/stats/model/default/local_cache_event_stat.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/stats/sendbird_statistics.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/stats/stat_utils.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_io/io.dart';
 
 class DBManager {
-  final _dbName = 'sendbird_chat';
-  final _maxDBFileSize = 256; // MB
+  final int _dbVersion = 2;
+  final String _dbName = 'sendbird_chat';
+  final int _maxDBFileSize = 256; // MB
+  final String _dbVersionKey = 'com.sendbird.chat.db_version';
 
   late final Isar _isar;
   bool _isInitialized = false;
@@ -48,11 +52,21 @@ class DBManager {
 
   DBManager({required Chat chat}) : _chat = chat;
 
+  bool isInitialized() {
+    return _isInitialized;
+  }
+
   DB getDB() {
     return _db;
   }
 
   Future<bool> init() async {
+    sbLog.i(StackTrace.current);
+
+    if (kIsWeb) {
+      return false;
+    }
+
     try {
       if (_chat.isTest) {
         // https://github.com/isar/isar#unit-tests
@@ -95,7 +109,18 @@ class DBManager {
 
     _db = DB(chat: _chat, isar: _isar);
     _isInitialized = true;
+
+    await _checkVersion();
     return true;
+  }
+
+  Future<void> _checkVersion() async {
+    final prefs = await SharedPreferences.getInstance();
+    final preDbVersion = prefs.getInt(_dbVersionKey);
+    if (preDbVersion == null || _dbVersion > preDbVersion) {
+      await clear();
+      await prefs.setInt(_dbVersionKey, _dbVersion);
+    }
   }
 
   bool isEnabled() {
@@ -118,11 +143,14 @@ class DBManager {
   }
 
   Future<void> write(Function writeFunc, {bool force = false}) async {
-    if (isEnabled() || force) {
+    if (isEnabled() || (_isInitialized && force)) {
       try {
         await _db.write(writeFunc);
       } catch (e) {
         sbLog.e(StackTrace.current, e.toString());
+        if (_chat.isTest) {
+          rethrow;
+        }
 
         _chat.chatContext.options.useCollectionCaching = false;
         await clear();
@@ -133,6 +161,7 @@ class DBManager {
   Future<void> clear() async {
     if (isEnabled()) {
       try {
+        sbLog.d(StackTrace.current);
         await _db.clear();
       } catch (e) {
         sbLog.e(StackTrace.current, e.toString());
@@ -223,7 +252,7 @@ class DBManager {
   }
 
   // Channel
-  Future<void> deleteMessagesInChannel(channelUrl) async {
+  Future<void> deleteMessagesInChannel(String channelUrl) async {
     if (isEnabled()) {
       // Messages
       await deleteMessagesInDeletedChannel(channelUrl);
@@ -281,9 +310,6 @@ class DBManager {
         // ChannelAccess
         await _db.deleteChannelAccess(channelUrl);
 
-        // ChannelChangeLogInfo
-        await _db.deleteChannelInfo();
-
         // Messages
         await deleteMessagesInDeletedChannel(channelUrl);
 
@@ -291,6 +317,14 @@ class DBManager {
         await _db.deleteMessageChangeLogInfo(channelUrl);
       }
     }
+  }
+
+  Future<void> clearMessagesInChannel(String channelUrl) async {
+    // Messages
+    await deleteMessagesInDeletedChannel(channelUrl);
+
+    // MessageChangeLogInfo
+    await _db.deleteMessageChangeLogInfo(channelUrl);
   }
 
   // FeedChannel
@@ -326,9 +360,6 @@ class DBManager {
 
         // ChannelAccess
         await _db.deleteChannelAccess(channelUrl);
-
-        // ChannelChangeLogInfo
-        await _db.deleteChannelInfo();
 
         // Messages
         await deleteMessagesInDeletedChannel(channelUrl);
@@ -376,9 +407,10 @@ class DBManager {
     required int timestamp,
     required MessageListParams params,
     required bool isPrevious,
+    int? messageOffsetTimestamp,
   }) async {
     if (isEnabled()) {
-      return await _db.getMessages(
+      List<RootMessage> messages = await _db.getMessages(
         channelType,
         channelUrl,
         sendingStatus,
@@ -386,8 +418,52 @@ class DBManager {
         params,
         isPrevious,
       );
+
+      if (channelType == ChannelType.group && messageOffsetTimestamp != null) {
+        return _applyMessageOffsetTimestamp(
+          channelType: channelType,
+          channelUrl: channelUrl,
+          messages: messages,
+          messageOffsetTimestamp: messageOffsetTimestamp,
+        );
+      } else {
+        return messages;
+      }
     }
     return [];
+  }
+
+  Future<List<RootMessage>> _applyMessageOffsetTimestamp({
+    required ChannelType channelType,
+    required String channelUrl,
+    required List<RootMessage> messages,
+    required int messageOffsetTimestamp,
+  }) async {
+    List<RootMessage> resultMessages = [];
+    List<String> deletedMessageIds = [];
+
+    for (final message in messages) {
+      if (message.createdAt < messageOffsetTimestamp) {
+        deletedMessageIds.add(message.rootId);
+      } else {
+        resultMessages.add(message);
+      }
+    }
+
+    if (deletedMessageIds.isNotEmpty) {
+      await _db.deleteMessagesInChunk(
+        channelUrl: channelUrl,
+        rootIds: deletedMessageIds,
+      );
+
+      for (final messageId in deletedMessageIds) {
+        await _db.deleteUserMessage(messageId);
+        await _db.deleteFileMessage(messageId);
+        await _db.deleteAdminMessage(messageId);
+      }
+    }
+
+    return resultMessages;
   }
 
   Future<List<BaseMessage>> getPendingMessages({
@@ -423,31 +499,31 @@ class DBManager {
     required String channelUrl,
     required List<BaseMessage> messages,
   }) async {
-    if (isEnabled()) {
-      final failedMessages = messages
-          .where((message) => message.sendingStatus == SendingStatus.failed)
-          .toList();
+    final failedMessages = messages
+        .where((message) => message.sendingStatus == SendingStatus.failed)
+        .toList();
 
+    if (isEnabled()) {
       await _db.removeFailedMessages(
         channelType: channelType,
         channelUrl: channelUrl,
         messages: failedMessages,
       );
+    }
 
-      // Event
-      for (final messageCollection
-          in _chat.collectionManager.baseMessageCollections) {
-        if (messageCollection.baseChannel.channelUrl == channelUrl) {
-          _chat.collectionManager.sendEventsToMessageCollection(
-            messageCollection: messageCollection,
-            baseChannel: messageCollection.baseChannel,
-            eventSource: CollectionEventSource.eventMessageDeleted,
-            sendingStatus: SendingStatus.failed,
-            deletedMessageIds:
-                failedMessages.map((message) => message.rootId).toList(),
-          );
-          break;
-        }
+    // Event
+    for (final messageCollection
+        in _chat.collectionManager.baseMessageCollections) {
+      if (messageCollection.baseChannel.channelUrl == channelUrl) {
+        _chat.collectionManager.sendEventsToMessageCollection(
+          messageCollection: messageCollection,
+          baseChannel: messageCollection.baseChannel,
+          eventSource: CollectionEventSource.eventMessageDeleted,
+          sendingStatus: SendingStatus.failed,
+          deletedMessageIds:
+              failedMessages.map((message) => message.rootId).toList(),
+        );
+        break;
       }
     }
   }
@@ -461,27 +537,27 @@ class DBManager {
         channelType: channelType,
         channelUrl: channelUrl,
       );
+    }
 
-      // Event
-      for (final messageCollection
-          in _chat.collectionManager.baseMessageCollections) {
-        if (messageCollection.baseChannel.channelUrl == channelUrl) {
-          final failedMessages = messageCollection.messageList
-              .where((message) =>
-                  message is! BaseMessage ||
-                  message.sendingStatus == SendingStatus.failed)
-              .toList();
+    // Event
+    for (final messageCollection
+        in _chat.collectionManager.baseMessageCollections) {
+      if (messageCollection.baseChannel.channelUrl == channelUrl) {
+        final failedMessages = messageCollection.messageList
+            .where((message) =>
+                message is! BaseMessage ||
+                message.sendingStatus == SendingStatus.failed)
+            .toList();
 
-          _chat.collectionManager.sendEventsToMessageCollection(
-            messageCollection: messageCollection,
-            baseChannel: messageCollection.baseChannel,
-            eventSource: CollectionEventSource.eventMessageDeleted,
-            sendingStatus: SendingStatus.failed,
-            deletedMessageIds:
-                failedMessages.map((message) => message.rootId).toList(),
-          );
-          break;
-        }
+        _chat.collectionManager.sendEventsToMessageCollection(
+          messageCollection: messageCollection,
+          baseChannel: messageCollection.baseChannel,
+          eventSource: CollectionEventSource.eventMessageDeleted,
+          sendingStatus: SendingStatus.failed,
+          deletedMessageIds:
+              failedMessages.map((message) => message.rootId).toList(),
+        );
+        break;
       }
     }
   }
@@ -502,10 +578,25 @@ class DBManager {
     required ChannelType channelType,
     required String channelUrl,
     required int timestamp,
+    int? messageOffsetTimestamp,
   }) async {
     if (isEnabled()) {
-      return await _db.getStartingPointMessages(
-          channelType, channelUrl, timestamp);
+      List<RootMessage> messages = await _db.getStartingPointMessages(
+        channelType,
+        channelUrl,
+        timestamp,
+      );
+
+      if (channelType == ChannelType.group && messageOffsetTimestamp != null) {
+        return _applyMessageOffsetTimestamp(
+          channelType: channelType,
+          channelUrl: channelUrl,
+          messages: messages,
+          messageOffsetTimestamp: messageOffsetTimestamp,
+        );
+      } else {
+        return messages;
+      }
     }
     return [];
   }
@@ -766,7 +857,7 @@ class DBManager {
       'collection_id': collectionId,
     };
     SendbirdStatistics.appendStat(
-      type: 'feature:local_cache_event',
+      type: SendbirdStatistics.featureLocalCacheEventType,
       data: data,
     );
   }
@@ -794,7 +885,7 @@ class DBManager {
     }
 
     SendbirdStatistics.appendStat(
-      type: 'feature:local_cache',
+      type: SendbirdStatistics.featureLocalCacheType,
       data: data,
     );
   }

@@ -177,7 +177,7 @@ class DB {
     return await _isar.cMessageChunks.count();
   }
 
-  // ChannelChangeLogInfo
+  // ChannelInfo
   Future<void> upsertChannelInfo(ChannelInfo info) async {
     await CChannelInfo.upsert(_chat, _isar, info);
   }
@@ -381,7 +381,12 @@ class DB {
     int timestamp,
   ) async {
     return await CChannelMessage.getStartingPointMessages(
-        _chat, _isar, channelType, channelUrl, timestamp);
+      _chat,
+      _isar,
+      channelType,
+      channelUrl,
+      timestamp,
+    );
   }
 
   Future<void> deleteChannelMessage(String rootId) async {

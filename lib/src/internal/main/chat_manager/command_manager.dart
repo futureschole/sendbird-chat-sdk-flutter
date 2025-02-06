@@ -8,6 +8,7 @@ import 'package:sendbird_chat_sdk/src/internal/main/chat/chat.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_cache/cache_service.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_cache/channel/meta_data_cache.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_context/chat_context.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/collection_manager/collection_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/connection_state/connected_state.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/model/delivery_status.dart';
@@ -46,24 +47,32 @@ class CommandManager {
   final Map<String, Completer<Command?>> _completerMap = {};
   final Map<String, Timer> _ackTimerMap = {};
   final Map<String, int> _readMap = {};
+  final Map<String, Completer<int?>> messageOffsetTsCompleterMap = {};
 
   final Chat _chat;
 
   CommandManager({required Chat chat}) : _chat = chat;
 
-  static Command? parseCommandString(String commandString) {
-    Command? command;
+  static List<Command> parseCommandsString(String commandsString) {
+    List<Command> commandList = [];
     try {
-      final payloadData = commandString.substring(4);
-      final payload = jsonDecode(payloadData);
-      payload['cmd'] = commandString.substring(0, 4);
-      command = Command.fromJson(payload);
-      command.payload = payload;
+      final commandStringList = commandsString.split('\n'); // for 'READ'
+      commandStringList.removeWhere((commandString) => commandString.isEmpty);
+
+      for (final commandString in commandStringList) {
+        final payloadData = commandString.substring(4);
+
+        final payload = jsonDecode(payloadData);
+        payload['cmd'] = commandString.substring(0, 4);
+
+        final command = Command.fromJson(payload);
+        command.payload = payload;
+        commandList.add(command);
+      }
     } catch (e) {
       sbLog.e(StackTrace.current, 'e: $e');
-      command = null;
     }
-    return command;
+    return commandList;
   }
 
   Future<void> updateSessionKey() async {
@@ -83,6 +92,7 @@ class CommandManager {
     }
     _ackTimerMap.clear();
     _readMap.clear();
+    messageOffsetTsCompleterMap.clear();
   }
 
   void clearCompleterMap({SendbirdException? e}) {
@@ -377,8 +387,8 @@ class CommandManager {
     } else if (cmd.payload['expires_in'] != null
         ? cmd.payload['expires_in'] < 0
         : false) {
-      // If session token is expired, then log out
       await _chat.connectionManager.disconnect(logout: true);
+      _chat.eventManager.notifySessionClosed();
     } else {
       await _chat.sessionManager.updateSessionKey();
     }
@@ -398,19 +408,6 @@ class CommandManager {
         commandType: cmd.cmd,
       );
 
-      if (event.requestId != null) {
-        // If sent by api then added id to cache -> done
-        if (message.channelType == ChannelType.group) {
-          dynamic messageId = message.getMessageId();
-          if (messageId is int) {
-            sendCommand(Command.buildMessageMACK(
-              message.channelUrl,
-              messageId,
-            ));
-          }
-        }
-      }
-
       bool shouldCallChannelChanged = false;
 
       if (message.channelType == ChannelType.group) {
@@ -429,6 +426,19 @@ class CommandManager {
 
       final GroupChannel? groupChannel = _eitherGroupOrFeed(channel);
       if (groupChannel != null) {
+        int? messageOffsetTs =
+            (await messageOffsetTsCompleterMap[groupChannel.channelUrl]
+                    ?.future) ??
+                groupChannel.messageOffsetTimestamp;
+
+        if (messageOffsetTs != null) {
+          if (message.createdAt < messageOffsetTs) {
+            sbLog.d(StackTrace.current,
+                'A received message before messageOffsetTimestamp is ignored.');
+            return; // Check
+          }
+        }
+
         if (groupChannel.hiddenState ==
             GroupChannelHiddenState.allowAutoUnhide) {
           groupChannel.isHidden = false;
@@ -437,6 +447,7 @@ class CommandManager {
 
         groupChannel.updateMember(event.sender);
 
+        // Last message
         if (channel is GroupChannel && message is BaseMessage) {
           if (groupChannel.shouldUpdateLastMessage(message, message.sender)) {
             shouldCallChannelChanged = true;
@@ -449,8 +460,25 @@ class CommandManager {
           }
         }
 
+        // Unread message count
         if (groupChannel.fromCache && groupChannel.updateUnreadCount(message)) {
           shouldCallChannelChanged = true;
+        }
+
+        // MACK
+        final isNonBroadcastSuperGroup =
+            channel is GroupChannel && channel.isSuper && !channel.isBroadcast;
+        final shouldDisableMACK = isNonBroadcastSuperGroup &&
+            _chat.chatContext.appInfo?.disableSuperGroupMack == true;
+        if (!shouldDisableMACK &&
+            _chat.currentUser?.userId != event.sender?.userId) {
+          final messageId = message.getMessageId();
+          if (messageId is int) {
+            sendCommand(Command.buildMessageMACK(
+              message.channelUrl,
+              messageId,
+            ));
+          }
         }
       }
 
@@ -605,22 +633,23 @@ class CommandManager {
 
   Future<void> _processRead(Command cmd) async {
     try {
-      final status = ReadStatus.fromJson(cmd.payload);
-      status.saveToCache(_chat);
+      final readStatus = ReadStatus.fromJson(cmd.payload);
+      readStatus.saveToCache(_chat);
 
       final channel = await BaseChannel.getBaseChannel(
-        status.channelType,
-        status.channelUrl,
+        readStatus.channelType,
+        readStatus.channelUrl,
         chat: _chat,
       );
 
       final GroupChannel? groupChannel = _eitherGroupOrFeed(channel);
       if (groupChannel != null) {
-        final isCurrentUser = status.userId == _chat.chatContext.currentUserId;
+        final isCurrentUser =
+            readStatus.userId == _chat.chatContext.currentUserId;
         final hasUnreadCount = (groupChannel.unreadMessageCount > 0 ||
             groupChannel.unreadMentionCount > 0);
         if (isCurrentUser) {
-          groupChannel.myLastRead = status.timestamp;
+          groupChannel.myLastRead = readStatus.timestamp;
           if (groupChannel.fromCache) groupChannel.clearUnreadCount();
           if (hasUnreadCount) _chat.eventManager.notifyChannelChanged(channel);
         } else {
@@ -634,20 +663,20 @@ class CommandManager {
 
   Future<void> _processDelivery(Command cmd) async {
     try {
-      final status = DeliveryStatus.fromJson(cmd.payload);
+      final deliveryStatus = DeliveryStatus.fromJson(cmd.payload);
 
-      final GroupChannel groupChannel =
-          await GroupChannel.getChannel(status.channelUrl);
       final currentUserId = _chat.chatContext.currentUserId;
       var shouldCallDelivery = true;
-      if (status.updatedDeliveryStatus.length == 1 &&
-          status.updatedDeliveryStatus[currentUserId] != null) {
+      if (deliveryStatus.updatedDeliveryStatus.length == 1 &&
+          deliveryStatus.updatedDeliveryStatus[currentUserId] != null) {
         shouldCallDelivery = false;
       }
 
-      status.saveToCache(_chat);
+      deliveryStatus.saveToCache(_chat);
 
       if (shouldCallDelivery) {
+        final GroupChannel groupChannel =
+            await GroupChannel.getChannel(deliveryStatus.channelUrl);
         _chat.eventManager.notifyDeliveryStatusUpdated(groupChannel);
       }
     } catch (e) {
@@ -707,7 +736,6 @@ class CommandManager {
         'cmd: ${cmd.cmd}, errorMessage: ${cmd.errorMessage ?? ''}');
 
     if (cmd.errorCode == SendbirdError.sessionKeyExpired) {
-      await _chat.connectionManager.disconnect(logout: true);
       await _chat.sessionManager.updateSessionKey();
     } else if (cmd.errorCode == SendbirdError.accessTokenRevoked) {
       if (_chat.chatContext.loginCompleter != null &&
@@ -821,7 +849,7 @@ class CommandManager {
 
       final GroupChannel? groupChannel = _eitherGroupOrFeed(channel);
       if (groupChannel != null) {
-        final status = TypingStatus(
+        final typingStatus = TypingStatus(
           channelType: ChannelType.group,
           channelUrl: event.channelUrl,
           user: user,
@@ -829,9 +857,9 @@ class CommandManager {
         );
 
         if (start) {
-          status.saveToCache(_chat);
+          typingStatus.saveToCache(_chat);
         } else {
-          status.removeFromCache(_chat);
+          typingStatus.removeFromCache(_chat);
         }
 
         _chat.eventManager.notifyChannelTypingStatusUpdated(groupChannel);
@@ -902,6 +930,12 @@ class CommandManager {
         if (user.isCurrentUser) {
           groupChannel.myMutedState =
               muted ? MuteState.muted : MuteState.unmuted;
+
+          final remainingDuration = event.data['remaining_duration'] as int?;
+          if (remainingDuration != null) {
+            _chat.collectionManager
+                .setUnmuteTimer(groupChannel, remainingDuration);
+          }
         }
 
         final member = groupChannel.members
@@ -951,7 +985,7 @@ class CommandManager {
           }
         } else {
           final groupChannel =
-              GroupChannel.getChannelFromCache(event.channelUrl);
+              await GroupChannel.getChannelFromCache(event.channelUrl);
 
           if (groupChannel != null) {
             if (groupChannel.isSuper) {
@@ -975,7 +1009,7 @@ class CommandManager {
               }
             }
             _chat.eventManager.notifyUserLeft(groupChannel, member);
-            _chat.eventManager.notifyChannelMemberCountChanged([groupChannel]);
+            // _chat.eventManager.notifyChannelMemberCountChanged([groupChannel]); // Check
           }
         }
       }
@@ -1230,7 +1264,7 @@ class CommandManager {
         event.channelType,
         event.channelUrl,
         chat: _chat,
-      );
+      ); // Check
 
       final GroupChannel? groupChannel = _eitherGroupOrFeed(channel);
       if (groupChannel != null) {

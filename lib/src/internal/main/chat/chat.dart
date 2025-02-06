@@ -1,6 +1,7 @@
 // Copyright (c) 2023 Sendbird, Inc. All rights reserved.
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -17,6 +18,7 @@ import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/event_dispatche
 import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/event_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/chat_manager/session_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/logger/sendbird_logger.dart';
+import 'package:sendbird_chat_sdk/src/internal/main/model/delivery_status.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/stats/stat_manager.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/utils/async/async_queue.dart';
 import 'package:sendbird_chat_sdk/src/internal/main/utils/async/async_task.dart';
@@ -60,7 +62,7 @@ part 'chat_notifications.dart';
 part 'chat_push.dart';
 part 'chat_user.dart';
 
-const sdkVersion = '4.2.8';
+const sdkVersion = '4.2.30';
 
 // Internal implementation for main class. Do not directly access this class.
 class Chat with WidgetsBindingObserver {
@@ -88,8 +90,8 @@ class Chat with WidgetsBindingObserver {
   ];
 
   bool? _isObserverRegistered;
-  ConnectivityResult _connectivityResult = ConnectivityResult.none;
   int lastMarkAsReadTimestamp;
+  bool isBackground = false;
 
   // This allows a value of type T or T? to be treated as a value of type T?.
   // We use this so that APIs that have become non-nullable can still be used
@@ -175,13 +177,19 @@ class Chat with WidgetsBindingObserver {
   Future<void> didChangeAppLifecycleState(AppLifecycleState state) async {
     sbLog.i(StackTrace.current, 'state: $state');
 
-    if (state == AppLifecycleState.paused) await _handleEnterBackground();
-    if (state == AppLifecycleState.resumed) await _handleEnterForeground();
+    if (state == AppLifecycleState.paused) {
+      isBackground = true;
+      await _handleEnterBackground();
+    } else if (state == AppLifecycleState.resumed) {
+      isBackground = false;
+      await _handleEnterForeground();
+    }
   }
 
   Future<void> _handleEnterBackground() async {
     sbLog.i(StackTrace.current);
     channelCache.markAsDirtyAll();
+
     if (chatContext.isChatConnected) {
       await connectionManager.enterBackground();
     }
@@ -207,35 +215,45 @@ class Chat with WidgetsBindingObserver {
 
       Connectivity()
           .onConnectivityChanged
-          .listen((ConnectivityResult result) async {
-        sbLog.d(StackTrace.current, result.toString());
+          .listen((dynamic connectivityResults) async {
+        final List<ConnectivityResult> results = [];
 
-        switch (result) {
-          case ConnectivityResult.none:
-            channelCache.markAsDirtyAll(); // Check
-            await connectionManager.disconnect(logout: false);
-            break;
-          case ConnectivityResult.mobile:
-          case ConnectivityResult.wifi:
-          case ConnectivityResult.ethernet:
-          case ConnectivityResult.vpn:
-          case ConnectivityResult.other:
-            if (_connectivityResult == ConnectivityResult.none) {
-              if (chatContext.isChatConnected) {
-                await connectionManager.reconnect(reset: true);
-              }
-              if (chatContext.isFeedAuthenticated) {
-                collectionManager.refreshNotificationCollections();
-              }
-            }
-            break;
-          case ConnectivityResult.bluetooth:
-            break;
-          default:
-            break;
+        if (connectivityResults is ConnectivityResult) {
+          // connectivity_plus <6.0.0
+          results.add(connectivityResults);
+          sbLog.d(StackTrace.current,
+              '[connectivity_plus <6.0.0] ${results.toString()}');
+        } else if (connectivityResults is List<ConnectivityResult>) {
+          // connectivity_plus ^6.0.0
+          results.addAll(connectivityResults);
+          sbLog.d(StackTrace.current,
+              '[connectivity_plus ^6.0.0] ${results.toString()}');
         }
 
-        _connectivityResult = result;
+        if (results.contains(ConnectivityResult.mobile) ||
+            results.contains(ConnectivityResult.wifi) ||
+            results.contains(ConnectivityResult.ethernet) ||
+            results.contains(ConnectivityResult.vpn) ||
+            results.contains(ConnectivityResult.other)) {
+          if (SendbirdChat.currentUser != null) {
+            if (chatContext.isChatConnected) {
+              sbLog.d(StackTrace.current, 'reconnect()');
+              await connectionManager.reconnect(reset: true);
+            }
+
+            if (chatContext.isFeedAuthenticated) {
+              sbLog.d(StackTrace.current, 'refreshNotificationCollections()');
+              collectionManager.refreshNotificationCollections();
+            }
+          }
+        } else if (results.contains(ConnectivityResult.bluetooth)) {
+          // Nothing
+        } else if (results.contains(ConnectivityResult.none)) {
+          channelCache.markAsDirtyAll(); // Check
+
+          sbLog.d(StackTrace.current, 'disconnect()');
+          await connectionManager.disconnect(logout: false);
+        }
       });
     }
   }
@@ -278,7 +296,7 @@ class Chat with WidgetsBindingObserver {
   }
 
   AppInfo? getAppInfo() {
-    sbLog.i(StackTrace.current);
+    // sbLog.i(StackTrace.current);
     return chatContext.appInfo;
   }
 
